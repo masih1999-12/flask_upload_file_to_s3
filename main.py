@@ -207,7 +207,7 @@ def upload_backup():
             return jsonify({'error': result}), 500
         
         # Cleanup old backups
-        s3_manager.cleanup_old_backups()
+        # s3_manager.cleanup_old_backups()
         
         # Delete temporary file
         temp_path.unlink()
