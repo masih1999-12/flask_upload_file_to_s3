@@ -1,4 +1,3 @@
-from botocore.config import Config as S3Config
 from botocore.exceptions import ClientError
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -54,49 +53,51 @@ config = Config()
 # ============================================================================
 
 class S3Manager:
-    """Handles S3 operations using IAM role credentials."""
-    
+    """Handles S3 operations using custom S3-compatible provider."""
+
     def __init__(self):
-        """S3 client uses IAM role — no keys needed."""
-        s3_config = S3Config(
-            max_pool_connections=5,
-            retries={'max_attempts': 3, 'mode': 'adaptive'},
-            signature_version='s3v4',
-        )
-        
-        self.client = boto3.client('s3', config=s3_config)
+        """Initialize S3 resource with custom endpoint and credentials."""
+        try:
+            self.s3_resource = boto3.resource(
+                's3',
+                endpoint_url=os.getenv('S3_ENDPOINT_URL'),
+                aws_access_key_id=os.getenv('S3_ACCESS_KEY'),
+                aws_secret_access_key=os.getenv('S3_SECRET_KEY')
+            )
+            self.bucket = self.s3_resource.Bucket(config.S3_BUCKET)
+        except Exception as exc:
+            logger.error(f"Failed to initialize S3 connection: {exc}")
+            raise
     
     def upload_file(self, filepath: Path, file_hash: str) -> Tuple[bool, str]:
         """Upload file to S3 with metadata."""
         try:
             if not filepath.exists() or filepath.stat().st_size == 0:
                 return False, "File not found or empty"
-            
+
             if filepath.stat().st_size > config.MAX_FILE_SIZE:
                 return False, f"File exceeds max size of {config.MAX_FILE_SIZE / (1024*1024)}MB"
-            
+
             s3_key = self._generate_s3_key(filepath.name)
-            
+
             metadata = {
                 'uploaded-at': datetime.now().isoformat(),
                 'file-hash': file_hash,
                 'original-filename': filepath.name,
             }
-            
-            self.client.upload_file(
-                str(filepath),
-                config.S3_BUCKET,
-                s3_key,
-                ExtraArgs={
-                    'ServerSideEncryption': 'AES256',
-                    'Metadata': metadata,
-                    'ContentType': 'application/x-sqlite3'
-                }
-            )
-            
+
+            with open(filepath, "rb") as file:
+                self.bucket.put_object(
+                    ACL='private',
+                    Body=file,
+                    Key=s3_key,
+                    Metadata=metadata,
+                    ContentType='application/x-sqlite3'
+                )
+
             logger.info(f"Uploaded to S3: s3://{config.S3_BUCKET}/{s3_key}")
             return True, s3_key
-            
+
         except ClientError as e:
             logger.error(f"S3 error: {e}")
             return False, str(e)
@@ -108,29 +109,18 @@ class S3Manager:
         """Remove backups older than retention period."""
         try:
             cutoff_date = datetime.now() - timedelta(days=config.RETENTION_DAYS)
-            
-            response = self.client.list_objects_v2(
-                Bucket=config.S3_BUCKET,
-                Prefix=config.S3_KEY_PREFIX
-            )
-            
-            if 'Contents' not in response:
-                return 0
-            
+
             deleted_count = 0
-            for obj in response['Contents']:
-                if obj['LastModified'].replace(tzinfo=None) < cutoff_date:
-                    self.client.delete_object(
-                        Bucket=config.S3_BUCKET,
-                        Key=obj['Key']
-                    )
+            for obj in self.bucket.objects.filter(Prefix=config.S3_KEY_PREFIX):
+                if obj.last_modified.replace(tzinfo=None) < cutoff_date:
+                    obj.delete()
                     deleted_count += 1
-            
+
             if deleted_count > 0:
                 logger.info(f"Cleaned up {deleted_count} old backups from S3")
-            
+
             return deleted_count
-            
+
         except ClientError as e:
             logger.error(f"Cleanup error: {e}")
             return 0
@@ -194,8 +184,8 @@ def upload_backup():
             return jsonify({'error': 'Missing file_hash'}), 400
         
         # Validate file type (should be .db)
-        if not file.filename.endswith('.db'):
-            return jsonify({'error': 'Invalid file type'}), 400
+        # if not file.filename.endswith('.db'):
+        #     return jsonify({'error': 'Invalid file type'}), 400
         
         # Save temporarily
         temp_path = config.TEMP_UPLOAD_DIR / file.filename
@@ -254,11 +244,31 @@ def _calculate_hash(filepath: Path) -> str:
 # ERROR HANDLERS
 # ============================================================================
 
-@app.errorhandler(413)
-def request_entity_too_large(e):
-    return jsonify({'error': 'File too large'}), 413
+@app.errorhandler(400)
+def bad_request(e):
+    logger.error(f"Bad request from {request.remote_addr}: {e}")
+    return jsonify({'error': 'Bad request'}), 400
+
+
+@app.errorhandler(401)
+def unauthorized(e):
+    logger.warning(f"Unauthorized access attempt from {request.remote_addr}: {e}")
+    return jsonify({'error': 'Unauthorized'}), 401
 
 
 @app.errorhandler(404)
 def not_found(e):
+    logger.warning(f"Not found - {request.method} {request.path} from {request.remote_addr}: {e}")
     return jsonify({'error': 'Not found'}), 404
+
+
+@app.errorhandler(413)
+def request_entity_too_large(e):
+    logger.error(f"File too large from {request.remote_addr}: {e}")
+    return jsonify({'error': 'File too large'}), 413
+
+
+@app.errorhandler(500)
+def internal_server_error(e):
+    logger.error(f"Internal server error: {e}", exc_info=True)
+    return jsonify({'error': 'Internal server error'}), 500
