@@ -4,7 +4,26 @@ services:
   flask-s3-uploader:
     build: .
     container_name: flask-s3-uploader
-    ports:
-      - "8000:8000"
+    expose:
+      - "8000"
     env_file: ./.env
     restart: always
+    networks:
+      - flask-network
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-proxy
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - flask-s3-uploader
+    restart: always
+    networks:
+      - flask-network
+
+networks:
+  flask-network:
+    driver: bridge

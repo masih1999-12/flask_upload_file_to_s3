@@ -69,8 +69,18 @@ class S3Manager:
             logger.error(f"Failed to initialize S3 connection: {exc}")
             raise
     
-    def upload_file(self, filepath: Path, file_hash: str) -> Tuple[bool, str]:
-        """Upload file to S3 with metadata."""
+    def file_exists(self, s3_key: str) -> bool:
+        """Check if file already exists in S3."""
+        try:
+            self.s3_resource.Object(config.S3_BUCKET, s3_key).load()
+            return True
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                return False
+            raise
+
+    def upload_file(self, filepath: Path, file_hash: str, s3_key: str) -> Tuple[bool, str]:
+        """Upload file to S3 with metadata if it doesn't already exist."""
         try:
             if not filepath.exists() or filepath.stat().st_size == 0:
                 return False, "File not found or empty"
@@ -78,7 +88,10 @@ class S3Manager:
             if filepath.stat().st_size > config.MAX_FILE_SIZE:
                 return False, f"File exceeds max size of {config.MAX_FILE_SIZE / (1024*1024)}MB"
 
-            s3_key = self._generate_s3_key(filepath.name)
+            # Check if file already exists in S3
+            if self.file_exists(s3_key):
+                logger.info(f"File already exists in S3, skipping upload: {s3_key}")
+                return True, f"already_exists:{s3_key}"
 
             metadata = {
                 'uploaded-at': datetime.now().isoformat(),
@@ -125,10 +138,6 @@ class S3Manager:
             logger.error(f"Cleanup error: {e}")
             return 0
     
-    def _generate_s3_key(self, filename: str) -> str:
-        """Generate S3 key with timestamp."""
-        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        return f"{config.S3_KEY_PREFIX}/{timestamp}_{filename}"
 
 
 # ============================================================================
@@ -165,60 +174,76 @@ def health():
 def upload_backup():
     """
     Receive database backup from client and upload to S3.
-    
+
     Request:
-        - file: SQLite database file
+        - file: SQLite database file (filename should be unique, e.g., "2024-01-15_12-30-45_backup.db")
         - file_hash: SHA256 hash for integrity verification
     """
     try:
         # Validate request
         if 'file' not in request.files:
             return jsonify({'error': 'No file part'}), 400
-        
+
         file = request.files['file']
         if file.filename == '':
             return jsonify({'error': 'No selected file'}), 400
-        
+
         claimed_hash = request.form.get('file_hash', '')
         if not claimed_hash:
             return jsonify({'error': 'Missing file_hash'}), 400
-        
+
+        # Generate S3 key from filename
+        s3_key = f"{config.S3_KEY_PREFIX}/{file.filename}"
+
         # Validate file type (should be .db)
         # if not file.filename.endswith('.db'):
         #     return jsonify({'error': 'Invalid file type'}), 400
-        
+
         # Save temporarily
         temp_path = config.TEMP_UPLOAD_DIR / file.filename
         file.save(str(temp_path))
-        
+
         # Verify file hash (integrity check)
         actual_hash = _calculate_hash(temp_path)
         if actual_hash != claimed_hash:
             temp_path.unlink()
             logger.error(f"Hash mismatch for {file.filename}")
             return jsonify({'error': 'File integrity check failed'}), 400
-        
-        # Upload to S3
+
+        # Upload to S3 (will skip if file already exists)
         s3_manager = S3Manager()
-        success, result = s3_manager.upload_file(temp_path, actual_hash)
-        
+        success, result = s3_manager.upload_file(temp_path, actual_hash, s3_key)
+
         if not success:
             temp_path.unlink()
             return jsonify({'error': result}), 500
-        
+
         # Cleanup old backups
         # s3_manager.cleanup_old_backups()
-        
+
         # Delete temporary file
         temp_path.unlink()
-        
+
+        # Check if file already existed
+        already_existed = result.startswith('already_exists:')
+        if already_existed:
+            actual_key = result.split(':', 1)[1]
+            logger.info(f"File already exists, skipped upload: {actual_key}")
+            return jsonify({
+                'status': 'success',
+                's3_key': actual_key,
+                'file_hash': actual_hash,
+                'already_existed': True
+            }), 200
+
         logger.info(f"Backup uploaded successfully: {result}")
         return jsonify({
             'status': 'success',
             's3_key': result,
-            'file_hash': actual_hash
+            'file_hash': actual_hash,
+            'already_existed': False
         }), 200
-        
+
     except Exception as e:
         logger.error(f"Backup upload error: {e}")
         try:
