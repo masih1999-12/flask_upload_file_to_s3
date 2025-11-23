@@ -6,17 +6,7 @@ services:
     container_name: flask-s3-uploader
     ports:
       - "8000:8000"
-    environment:
-      - S3_BUCKET=${S3_BUCKET}
-      - S3_KEY_PREFIX=${S3_KEY_PREFIX}
-      - AWS_REGION=${AWS_REGION:-us-east-1}
-      - BACKEND_API_TOKEN=${BACKEND_API_TOKEN}
-      - TEMP_UPLOAD_DIR=/tmp/db-uploads
-      - RETENTION_DAYS=${RETENTION_DAYS:-30}
+    env_file: ./.env
     volumes:
       - ./uploads:/tmp/db-uploads
-    restart: unless-stopped
-    # If running on EC2 with IAM role, credentials are automatically available
-    # If running locally, uncomment and mount AWS credentials:
-    # volumes:
-    #   - ~/.aws:/root/.aws:ro
+    restart: always
